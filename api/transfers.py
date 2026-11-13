@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from api import db
-from api.models import Product, Stock, Transfer, Warehouse
+from api.models import Product, RetiredWarehouse, Stock, Transfer, Warehouse
 
 router = APIRouter(prefix="/transfers", tags=["transfers"])
 
@@ -120,7 +120,9 @@ def receive_transfer(transfer_id: UUID) -> TransferResult:
         if transfer.received_at is not None:
             return result(transfer)
 
-        session.get_one(Warehouse, transfer.destination_id, with_for_update=True)
+        destination = session.get(Warehouse, transfer.destination_id, with_for_update=True)
+        if destination is None and session.get(RetiredWarehouse, transfer.destination_id) is None:
+            raise HTTPException(409, "Место учёта назначения не найдено")
         stock_insert = insert(Stock).values(
             sku=transfer.sku,
             warehouse_id=transfer.destination_id,

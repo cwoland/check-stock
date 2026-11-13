@@ -20,7 +20,7 @@ def sessions(monkeypatch):
 
     def clear_tables():
         with engine.begin() as connection:
-            connection.execute(text("TRUNCATE transfers, receipts, stock, products, warehouses RESTART IDENTITY"))
+            connection.execute(text("TRUNCATE shipments, transfers, receipts, stock, products, warehouses, retired_warehouses RESTART IDENTITY"))
 
     try:
         clear_tables()

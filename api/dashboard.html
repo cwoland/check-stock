@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CheckStock — Остатки</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f2f5f2;color:#18332d;font:15px/1.5 system-ui,sans-serif}
+header{background:#123b31;color:white;padding:32px max(24px,calc((100vw - 1120px)/2))}
+header p{margin:0;color:#b5ddcc;font-weight:700}
+h1{font-size:clamp(32px,5vw,52px);margin:6px 0}
+h2{margin:0 0 14px;font-size:22px}
+main{max-width:1168px;margin:auto;padding:24px;display:grid;gap:18px}
+section{background:white;border:1px solid #dce6de;border-radius:14px;padding:20px;min-width:0}
+.scroll{overflow:auto}
+table{border-collapse:collapse;width:100%;white-space:nowrap}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #e6eee8}
+th{font-size:13px;color:#435f56;background:#eff5f0}
+td:last-child{white-space:normal}
+form,.actions{display:flex;align-items:end;flex-wrap:wrap;gap:10px}
+label{display:grid;gap:4px;font-weight:600}
+input,select,button{font:inherit;padding:7px 10px;border:1px solid #aabfb2;border-radius:7px;background:white;color:inherit}
+button{background:#165844;color:white;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+#status{margin:0;min-height:1.5em;color:#245a45}
+#status[data-error=true]{color:#9d2822}
+</style>
+<header><p>CheckStock</p><h1>Остатки и движения</h1></header>
+<main>
+<section><h2>Операция</h2><form id="operation">
+<label>Действие<select id="kind">
+<option value="receipt">Приход</option><option value="transfer">Перемещение между ФФ</option>
+<option value="fbs">Резерв FBS</option><option value="fbo">Отправка FBO</option>
+<option value="create">Добавить ФФ</option><option value="rename">Переименовать ФФ</option>
+<option value="archive">Архивировать ФФ</option>
+</select></label>
+<div id="fields" class="actions"></div><button id="submit" disabled>Выполнить</button>
+</form><p id="status" role="status" aria-live="polite">Загрузка…</p></section>
+<section><h2>Остатки по ФФ</h2><div id="balances" class="scroll"></div></section>
+<section><h2>В пути и на маркетплейсе</h2><div id="transit" class="scroll"></div></section>
+<section><h2>Резервы FBS</h2><div id="reserves" class="scroll"></div></section>
+<section><h2>История операций</h2><div id="history" class="scroll"></div></section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let data, busy = false, pending;
+const date = value => new Date(value).toLocaleString("ru-RU");
+const warehouseLabel = row => row.deleted ? `${row.name} (удалён)` :
+  row.archived_at ? `${row.name} (в архиве)` : row.name;
+const shipmentDestination = row => row.kind === "fbs" ? "Клиент (FBS)" : "Маркетплейс (FBO)";
+const statuses = {reserved:"Резерв FBS", cancelled:"Отмена FBS", sent:"Отправка", received:"Приёмка FBO"};
+
+function table(id, headers, rows) {
+  const container = $(id);
+  container.replaceChildren();
+  if (!rows.length) { container.textContent = "Пока нет записей"; return; }
+  const table = document.createElement("table");
+  const heading = table.createTHead().insertRow();
+  for (const title of headers) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.textContent = title;
+    heading.append(th);
+  }
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    for (const value of row) {
+      const cell = tr.insertCell();
+      if (value instanceof Node) cell.append(value);
+      else cell.textContent = value;
+    }
+  }
+  container.append(table);
+}
+
+async function request(path, method = "GET", payload) {
+  const response = await fetch(path, {
+    method,
+    ...(payload === undefined ? {} : {
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)
+    })
+  });
+  if (response.ok) return response.status === 204 ? null : response.json();
+  const {detail} = await response.json();
+  if (typeof detail === "string") throw new Error(detail);
+  if (Array.isArray(detail)) throw new Error("Проверьте данные операции");
+  const counts = [
+    detail?.source_available == null ? "" : `на выбранном ФФ: ${detail.source_available}`,
+    detail?.total_available == null ? "" : `всего: ${detail.total_available}`
+  ].filter(Boolean).join(", ");
+  throw new Error([detail?.message || "Ошибка запроса", counts].filter(Boolean).join(". "));
+}
+
+async function run(operation) {
+  if (busy) return;
+  busy = true;
+  $("submit").disabled = true;
+  $("status").dataset.error = false;
+  $("status").textContent = "Выполняется…";
+  try {
+    await operation();
+    $("status").textContent = "Операция выполнена. Обновляем данные…";
+    await refresh();
+    $("status").textContent = "Готово";
+  } catch (error) {
+    $("status").dataset.error = true;
+    $("status").textContent = error.message;
+  } finally {
+    busy = false;
+    $("submit").disabled = !data;
+  }
+}
+
+function action(label, path) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.onclick = () => run(() => request(path, "PUT"));
+  return button;
+}
+
+function render() {
+  const locations = [...data.warehouses, ...data.retired.map(row => ({...row, deleted:true}))];
+  const balances = new Map(data.stock.map(row => [JSON.stringify([row.sku,row.warehouse_id]), row]));
+  table("balances", ["Артикул", "Товар", "ФФ", "Физически", "Доступно", "Резерв FBS"],
+    data.products.flatMap(product => {
+      const rows = locations.filter(location => !location.deleted ||
+        balances.has(JSON.stringify([product.sku,location.id])));
+      return (rows.length ? rows : [{name:"—"}]).map(location => {
+        const stock = balances.get(JSON.stringify([product.sku,location.id]));
+        return [product.sku,product.name,warehouseLabel(location),stock?.physical ?? 0,
+          stock?.available ?? 0,stock?.reserved ?? 0];
+      });
+    }));
+  table("transit", ["Артикул","Откуда","Куда","Кол-во","Статус","Действие"], [
+    ...data.transfers.filter(row => !row.received_at).map(row => [
+      row.sku,row.source_name,row.destination_name,row.quantity,"В пути",
+      action("Принять",`/transfers/${row.id}/receive`)
+    ]),
+    ...data.shipments.filter(row => ["sent","received"].includes(row.status)).map(row => [
+      row.sku,row.warehouse_name,shipmentDestination(row),row.quantity,
+      row.status === "received" ? "Принято" : "В пути",
+      row.kind === "fbo" && row.status === "sent" ? action("Принять",`/shipments/${row.id}/receive`) : "—"
+    ])
+  ]);
+  table("reserves", ["Артикул","ФФ","Кол-во","Действия"],
+    data.shipments.filter(row => row.status === "reserved").map(row => {
+      const buttons = document.createElement("div");
+      buttons.className = "actions";
+      buttons.append(action("Отправить",`/shipments/${row.id}/send`),
+        action("Отменить",`/shipments/${row.id}/cancel`));
+      return [row.sku,row.warehouse_name,row.quantity,buttons];
+    }));
+  const history = data.receipts.map(row =>
+    [row.created_at,"Приход",row.sku,"—",row.warehouse_name,row.quantity]);
+  for (const row of data.transfers) {
+    history.push([row.sent_at,"Отправка между ФФ",row.sku,row.source_name,row.destination_name,row.quantity]);
+    if (row.received_at) history.push(
+      [row.received_at,"Приёмка на ФФ",row.sku,row.source_name,row.destination_name,row.quantity]);
+  }
+  for (const row of data.shipments) {
+    history.push([row.created_at,row.kind === "fbs" ? "Резерв FBS" : "Отправка FBO",
+      row.sku,row.warehouse_name,row.kind === "fbs" ? row.warehouse_name : shipmentDestination(row),row.quantity]);
+    if (row.confirmed_at) history.push([row.confirmed_at,statuses[row.status],row.sku,row.warehouse_name,
+      row.status === "cancelled" ? row.warehouse_name : shipmentDestination(row),row.quantity]);
+  }
+  history.sort((a,b) => Date.parse(b[0]) - Date.parse(a[0]));
+  table("history", ["Время","Операция","Артикул","Откуда","Куда","Кол-во"],
+    history.map(([time,...rest]) => [date(time),...rest]));
+}
+
+function field(label, name, options, attributes = {}, previous = {}) {
+  const wrapper = document.createElement("label");
+  wrapper.textContent = label;
+  const control = document.createElement(options ? "select" : "input");
+  Object.assign(control, {name, required:true}, attributes);
+  if (options) for (const [value,text] of options) control.add(new Option(text,value));
+  if (previous[name] !== undefined && (!options || options.some(([value]) => String(value) === previous[name]))) {
+    control.value = previous[name];
+  }
+  wrapper.append(control);
+  $("fields").append(wrapper);
+}
+
+function renderFields(previous = {}) {
+  if (!data) return;
+  $("fields").replaceChildren();
+  const kind = $("kind").value;
+  const active = data.warehouses.filter(row => !row.archived_at);
+  const locations = rows => rows.map(row => [row.id,warehouseLabel(row)]);
+  if (["create","rename","archive"].includes(kind)) {
+    if (kind !== "create") field("ФФ","warehouse_id",locations(active),{},previous);
+    if (kind !== "archive") field("Название","name",null,{},previous);
+  } else {
+    field("Артикул","sku",data.products.map(row => [row.sku,`${row.sku} · ${row.name}`]),{},previous);
+    field("ФФ","warehouse_id",locations(kind === "transfer" ? data.warehouses : active),{},previous);
+    if (kind === "transfer") field("ФФ назначения","destination_id",locations(active),{},previous);
+    field("Количество","quantity",null,{type:"number",min:1,max:2147483647},previous);
+  }
+}
+
+async function refresh() {
+  const previous = Object.fromEntries(new FormData($("operation")));
+  data = await request("/inventory");
+  render();
+  renderFields(previous);
+}
+
+$("kind").onchange = () => { pending = undefined; renderFields(); };
+$("operation").onsubmit = event => {
+  event.preventDefault();
+  const kind = $("kind").value;
+  const fields = Object.fromEntries(new FormData(event.currentTarget));
+  const warehouse_id = Number(fields.warehouse_id);
+  const quantity = Number(fields.quantity);
+  run(async () => {
+    if (kind === "create") return request("/warehouses","POST",{name:fields.name});
+    if (kind === "rename") return request(`/warehouses/${warehouse_id}`,"PATCH",{name:fields.name});
+    if (kind === "archive") return request(`/warehouses/${warehouse_id}`,"DELETE");
+    const signature = JSON.stringify([kind,fields]);
+    if (pending?.signature !== signature) pending = {signature,id:crypto.randomUUID()};
+    const {id} = pending;
+    const payload = {sku:fields.sku,warehouse_id,quantity};
+    if (kind === "receipt") await request(`/receipts/${id}`,"PUT",payload);
+    else if (kind === "transfer") await request(`/transfers/${id}`,"PUT",{
+      sku:fields.sku,source_id:warehouse_id,destination_id:Number(fields.destination_id),quantity
+    });
+    else await request(`/shipments/${id}`,"PUT",{...payload,kind});
+    pending = undefined;
+  });
+};
+refresh().then(() => {
+  $("status").textContent = "";
+  $("submit").disabled = false;
+}).catch(error => {
+  $("status").dataset.error = true;
+  $("status").textContent = error.message;
+});
+</script>
+</html>

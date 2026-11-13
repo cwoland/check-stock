@@ -30,7 +30,7 @@ class Stock(Base):
     )
 
     sku: Mapped[str] = mapped_column(ForeignKey('products.sku'), primary_key=True)
-    warehouse_id: Mapped[int] = mapped_column(ForeignKey('warehouses.id'), primary_key=True)
+    warehouse_id: Mapped[int] = mapped_column(primary_key=True)
     physical: Mapped[int]
     reserved: Mapped[int]
 
@@ -43,7 +43,7 @@ class Receipt(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True)
     sku: Mapped[str] = mapped_column(ForeignKey('products.sku'))
-    warehouse_id: Mapped[int | None] = mapped_column(ForeignKey('warehouses.id', ondelete='SET NULL'))
+    warehouse_id: Mapped[int]
     warehouse_name: Mapped[str]
     quantity: Mapped[int]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -58,8 +58,8 @@ class Transfer(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True)
     sku: Mapped[str] = mapped_column(ForeignKey("products.sku"))
-    source_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"))
-    destination_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"))
+    source_id: Mapped[int]
+    destination_id: Mapped[int]
     source_name: Mapped[str]
     destination_name: Mapped[str]
     quantity: Mapped[int]
@@ -67,3 +67,35 @@ class Transfer(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Shipment(Base):
+    __tablename__ = "shipments"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_shipments_quantity_positive"),
+        CheckConstraint(
+            "(kind = 'fbs' AND status IN ('reserved', 'sent', 'cancelled')) OR "
+            "(kind = 'fbo' AND status IN ('sent', 'received'))",
+            name="ck_shipments_kind_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    sku: Mapped[str] = mapped_column(ForeignKey("products.sku"))
+    warehouse_id: Mapped[int]
+    warehouse_name: Mapped[str]
+    kind: Mapped[str]
+    status: Mapped[str]
+    quantity: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RetiredWarehouse(Base):
+    __tablename__ = 'retired_warehouses'
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    name: Mapped[str]
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

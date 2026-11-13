@@ -1,3 +1,6 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
@@ -5,13 +8,50 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.dialects.postgresql import insert
 
+from api.dashboard import router as dashboard_router
 from api.db import SessionLocal
 from api.models import Product, Receipt, Stock, Warehouse
+from api.shipments import router as shipments_router
 from api.transfers import router as transfers_router
+from api.warehouses import purge_archived_warehouses
+from api.warehouses import router as warehouses_router
 
 
-app = FastAPI(title='CheckStock')
+logger = logging.getLogger(__name__)
+
+
+async def clean_archived_warehouses() -> None:
+    try:
+        await asyncio.to_thread(purge_archived_warehouses)
+    except Exception:
+        logger.exception("Ошибка очистки архивных ФФ")
+
+
+async def repeat_warehouse_cleanup(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60)
+        except TimeoutError:
+            await clean_archived_warehouses()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await clean_archived_warehouses()
+    stop = asyncio.Event()
+    cleanup = asyncio.create_task(repeat_warehouse_cleanup(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        await cleanup
+
+
+app = FastAPI(title='CheckStock', lifespan=lifespan)
 app.include_router(transfers_router)
+app.include_router(shipments_router)
+app.include_router(warehouses_router)
+app.include_router(dashboard_router)
 
 
 class ReceiptRequest(BaseModel):
